@@ -30,16 +30,44 @@ export interface Group {
   description?: string;
   baseCurrency: "INR";
   members: Member[];
+  customCategories?: string[]; // Store custom categories for the group
 }
 
-export interface Expense {
+export type SplitType = "equal" | "custom" | "percentage";
+
+export interface ExpenseSplit {
+  memberId: string;
+  amount: number;
+  percentage?: number; // Only used for percentage split type
+}
+
+export type ExpenseCategory = 
+  | 'food' 
+  | 'travel' 
+  | 'rent' 
+  | 'shopping' 
+  | 'groceries' 
+  | 'utilities' 
+  | 'entertainment' 
+  | 'healthcare' 
+  | 'transport' 
+  | 'other' 
+  | string; // Allow custom categories
+
+export interface ExpenseBase {
   expenseId: string;
   groupId: string;
   paidBy: string;
   amount: number;
   description?: string;
-  splitType: "equal";
+  category: ExpenseCategory;
+  splitType: SplitType;
   timestamp: string;
+  splitDetails?: ExpenseSplit[]; // Made optional in base type
+}
+
+export interface Expense extends ExpenseBase {
+  splitDetails: ExpenseSplit[]; // Required in the final type
 }
 
 export interface MemberBalance {

@@ -1,4 +1,4 @@
-import { Member, Group, Expense, MemberBalance, SettlementPair } from "@shared/api";
+import { Member, Group, Expense, ExpenseBase, MemberBalance, SettlementPair, SplitType, ExpenseSplit, ExpenseCategory } from "@shared/api";
 
 // In-memory demo state
 interface DemoState {
@@ -50,7 +50,13 @@ function seedDemo() {
       paidBy: "u1",
       amount: 600,
       description: "Dinner",
+      category: 'food',
       splitType: "equal",
+      splitDetails: [
+        { memberId: 'u1', amount: 200 },
+        { memberId: 'u2', amount: 200 },
+        { memberId: 'u3', amount: 200 }
+      ],
       timestamp: new Date().toISOString(),
     },
     {
@@ -58,8 +64,14 @@ function seedDemo() {
       groupId: "g1",
       paidBy: "u2",
       amount: 300,
-      description: "Snacks",
-      splitType: "equal",
+      description: "Movie tickets",
+      category: 'entertainment',
+      splitType: "custom",
+      splitDetails: [
+        { memberId: 'u1', amount: 100 },
+        { memberId: 'u2', amount: 100 },
+        { memberId: 'u3', amount: 100 }
+      ],
       timestamp: new Date().toISOString(),
     },
   ];
@@ -81,7 +93,13 @@ export function getDemoUser() {
   return state.users.find((u) => u.userId === "u1")!;
 }
 
-export function addGroup(input: { groupName: string; description?: string; baseCurrency?: "INR"; members?: Omit<Member, "memberId">[] }) {
+export function addGroup(input: { 
+  groupName: string; 
+  description?: string; 
+  baseCurrency?: "INR"; 
+  members?: Omit<Member, "memberId">[];
+  customCategories?: string[];
+}) {
   const groupId = `g${nextId("group_")}`.replace("group_", "");
   const baseCurrency: "INR" = "INR";
   const baseMembers = (input.members && input.members.length
@@ -101,9 +119,27 @@ export function addGroup(input: { groupName: string; description?: string; baseC
     description: input.description,
     baseCurrency,
     members,
+    customCategories: input.customCategories || []
   };
   state.groups.push(group);
   return group;
+}
+
+export function addCustomCategory(groupId: string, category: string): boolean {
+  const group = getGroup(groupId);
+  if (!group) return false;
+  
+  if (!group.customCategories) {
+    group.customCategories = [];
+  }
+  
+  // Don't add duplicates
+  const normalizedCategory = category.toLowerCase().trim();
+  if (!group.customCategories.includes(normalizedCategory)) {
+    group.customCategories.push(normalizedCategory);
+  }
+  
+  return true;
 }
 
 export function getGroup(groupId: string) {
@@ -128,22 +164,107 @@ export function removeMemberFromGroup(groupId: string, memberId: string) {
   return { ok: group.members.length < before } as const;
 }
 
-export function addExpenseToGroup(groupId: string, expense: Omit<Expense, "expenseId" | "groupId" | "splitType" | "timestamp"> & { timestamp?: string; splitType?: "equal" }) {
+function validateAndNormalizeExpenseSplit(
+  expense: Omit<ExpenseBase, "expenseId" | "groupId" | "timestamp">, 
+  groupMembers: Member[]
+): ExpenseSplit[] {
+  const { amount, splitType, splitDetails = [], paidBy } = expense;
+  
+  // Ensure the payer is included in the group
+  if (!groupMembers.some(m => m.memberId === paidBy)) {
+    throw new Error(`Payer ${paidBy} is not a member of the group`);
+  }
+  
+  // If no split details provided, default to equal split
+  if (splitDetails.length === 0) {
+    const perPerson = round2(amount / groupMembers.length);
+    return groupMembers.map(member => ({
+      memberId: member.memberId,
+      amount: perPerson
+    }));
+  }
+
+  // Validate split details
+  if (splitType === 'equal') {
+    const perPerson = round2(amount / groupMembers.length);
+    return groupMembers.map(member => ({
+      memberId: member.memberId,
+      amount: perPerson
+    }));
+  } 
+  
+  if (splitType === 'percentage') {
+    const totalPercentage = splitDetails.reduce((sum, d) => sum + (d.percentage || 0), 0);
+    if (Math.abs(totalPercentage - 100) > 0.01) {
+      throw new Error('Total percentage must be 100%');
+    }
+    
+    return splitDetails.map(d => ({
+      memberId: d.memberId,
+      amount: round2((d.percentage! / 100) * amount),
+      percentage: d.percentage
+    }));
+  }
+  
+  // For custom split, just validate the total matches
+  if (splitType === 'custom') {
+    const total = splitDetails.reduce((sum, d) => sum + d.amount, 0);
+    if (Math.abs(total - amount) > 0.01) {
+      throw new Error(`Custom split total (${total}) does not match expense amount (${amount})`);
+    }
+    return splitDetails.map(d => ({
+      memberId: d.memberId,
+      amount: d.amount
+    }));
+  }
+  
+  throw new Error(`Invalid split type: ${splitType}`);
+}
+
+export function addExpenseToGroup(
+  groupId: string, 
+  expense: Omit<ExpenseBase, "expenseId" | "groupId" | "timestamp"> & { 
+    timestamp?: string;
+    category?: ExpenseCategory;
+  }
+) {
   const group = getGroup(groupId);
   if (!group) return null;
   if (!group.members.some((m) => m.memberId === expense.paidBy)) return null;
-  const expenseId = `e${nextId("expense_")}`.replace("expense_", "");
-  const newExpense: Expense = {
-    expenseId,
-    groupId,
-    paidBy: expense.paidBy,
-    amount: Math.max(0, Number(expense.amount || 0)),
-    description: expense.description,
-    splitType: "equal",
-    timestamp: expense.timestamp || new Date().toISOString(),
-  };
-  state.expenses.push(newExpense);
-  return newExpense;
+  
+  const amount = Math.max(0, Number(expense.amount || 0));
+  const splitType = expense.splitType || 'equal';
+  
+  try {
+    // Create a validated expense with normalized split details
+    const validatedExpense = {
+      ...expense,
+      amount,
+      splitType,
+      category: expense.category || 'other',
+      description: expense.description || '',
+      timestamp: expense.timestamp || new Date().toISOString(),
+    };
+    
+    const splitDetails = validateAndNormalizeExpenseSplit(
+      validatedExpense,
+      group.members
+    );
+    
+    const expenseId = `e${nextId("expense_")}`.replace("expense_", "");
+    const newExpense: Expense = {
+      ...validatedExpense,
+      expenseId,
+      groupId,
+      splitDetails, // This is now guaranteed to be defined
+    };
+    
+    state.expenses.push(newExpense);
+    return newExpense;
+  } catch (error) {
+    console.error('Error adding expense:', error);
+    return null;
+  }
 }
 
 export function getExpenses(groupId: string) {
@@ -153,61 +274,118 @@ export function getExpenses(groupId: string) {
 export function computeBalances(groupId: string): { balances: MemberBalance[]; totalAmount: number; perHead: number } {
   const group = getGroup(groupId);
   if (!group) return { balances: [], totalAmount: 0, perHead: 0 };
+  
   const expenses = getExpenses(groupId);
-  const totalAmount = expenses.reduce((sum, e) => sum + e.amount, 0);
-  const n = group.members.length || 1;
-  const perHeadRaw = totalAmount / n;
-  const perHead = round2(perHeadRaw);
+  const totalAmount = round2(expenses.reduce((sum, e) => sum + e.amount, 0));
+  
+  // Initialize maps to track amounts
   const paidMap = new Map<string, number>();
-  for (const m of group.members) paidMap.set(m.memberId, 0);
-  for (const e of expenses) paidMap.set(e.paidBy, (paidMap.get(e.paidBy) || 0) + e.amount);
-  const balances: MemberBalance[] = group.members.map((m) => {
-    const paid = round2(paidMap.get(m.memberId) || 0);
-    const shouldPay = perHead;
-    const balance = round2(paid - shouldPay);
-    return { memberId: m.memberId, paid, shouldPay, balance };
+  const shouldPayMap = new Map<string, number>();
+  
+  // Initialize with all members
+  group.members.forEach(member => {
+    paidMap.set(member.memberId, 0);
+    shouldPayMap.set(member.memberId, 0);
   });
-  // Minor adjustment to ensure sum of balances equals 0 due to rounding
-  const sumBal = round2(balances.reduce((s, b) => s + b.balance, 0));
-  if (sumBal !== 0 && balances.length) {
-    // adjust the largest creditor/debtor slightly
-    if (sumBal > 0) {
-      const idx = balances.findIndex((b) => b.balance === Math.max(...balances.map((x) => x.balance)));
-      balances[idx].balance = round2(balances[idx].balance - sumBal);
-    } else {
-      const idx = balances.findIndex((b) => b.balance === Math.min(...balances.map((x) => x.balance)));
-      balances[idx].balance = round2(balances[idx].balance - sumBal);
+  
+  // Calculate amounts paid by each member
+  for (const expense of expenses) {
+    // Add to paid amount for the payer
+    paidMap.set(
+      expense.paidBy, 
+      round2((paidMap.get(expense.paidBy) || 0) + expense.amount)
+    );
+    
+    // Add to shouldPay for each member based on split details
+    for (const split of expense.splitDetails) {
+      shouldPayMap.set(
+        split.memberId,
+        round2((shouldPayMap.get(split.memberId) || 0) + split.amount)
+      );
     }
   }
-  return { balances, totalAmount: round2(totalAmount), perHead };
+  
+  // Calculate balances
+  const balances: MemberBalance[] = group.members.map((member) => {
+    const paid = paidMap.get(member.memberId) || 0;
+    const shouldPay = shouldPayMap.get(member.memberId) || 0;
+    const balance = round2(paid - shouldPay);
+    
+    return { 
+      memberId: member.memberId, 
+      paid, 
+      shouldPay, 
+      balance 
+    };
+  });
+  
+  // Calculate per head (average) for backward compatibility
+  const perHead = round2(totalAmount / (group.members.length || 1));
+  
+  return { 
+    balances, 
+    totalAmount, 
+    perHead 
+  };
 }
 
 export function computeSettlement(groupId: string): SettlementPair[] {
   const group = getGroup(groupId);
   if (!group) return [];
+  
   const { balances } = computeBalances(groupId);
-  const debtors = balances.filter((b) => b.balance < 0).map((b) => ({ id: b.memberId, amount: round2(-b.balance) }));
-  const creditors = balances.filter((b) => b.balance > 0).map((b) => ({ id: b.memberId, amount: round2(b.balance) }));
-  // sort for greedy: largest first
+  
+  // Get debtors (negative balance) and creditors (positive balance)
+  const debtors = balances
+    .filter((b) => b.balance < -0.01) // Small threshold to avoid floating point issues
+    .map((b) => ({ 
+      id: b.memberId, 
+      amount: round2(-b.balance),
+      name: group.members.find(m => m.memberId === b.memberId)?.name || b.memberId,
+      upiId: group.members.find(m => m.memberId === b.memberId)?.upiId || ''
+    }));
+    
+  const creditors = balances
+    .filter((b) => b.balance > 0.01) // Small threshold to avoid floating point issues
+    .map((b) => ({ 
+      id: b.memberId, 
+      amount: round2(b.balance),
+      name: group.members.find(m => m.memberId === b.memberId)?.name || b.memberId,
+      upiId: group.members.find(m => m.memberId === b.memberId)?.upiId || ''
+    }));
+  
+  // Sort for greedy algorithm: largest amounts first
   debtors.sort((a, b) => b.amount - a.amount);
   creditors.sort((a, b) => b.amount - a.amount);
 
   const pairs: SettlementPair[] = [];
   let i = 0, j = 0;
+  
   while (i < debtors.length && j < creditors.length) {
-    const d = debtors[i];
-    const c = creditors[j];
-    const pay = round2(Math.min(d.amount, c.amount));
-    const toMember = group.members.find((m) => m.memberId === c.id);
-    const upi = toMember?.upiId || "DEMO_UPI@upi";
-    const pn = encodeURIComponent(toMember?.name || "Demo");
-    const upiLink = `upi://pay?pa=${encodeURIComponent(upi)}&pn=${pn}&am=${pay.toFixed(2)}&cu=INR&tn=${encodeURIComponent("FairSplit-Demo")}`;
-    pairs.push({ from: d.id, to: c.id, amount: pay, upiLink });
-    d.amount = round2(d.amount - pay);
-    c.amount = round2(c.amount - pay);
-    if (d.amount === 0) i++;
-    if (c.amount === 0) j++;
+    const debtor = debtors[i];
+    const creditor = creditors[j];
+    const pay = round2(Math.min(debtor.amount, creditor.amount));
+    if (pay > 0.01) { // Only add if amount is significant (1 paisa threshold)
+      // Create a UPI deep link for the payment
+      const upiLink = `upi://pay?pa=${encodeURIComponent(creditor.upiId)}&am=${pay.toFixed(2)}&cu=INR&tn=FairSplit%20Settlement&pn=${encodeURIComponent(creditor.name)}`;
+      
+      pairs.push({
+        from: debtor.id,
+        to: creditor.id,
+        amount: pay,
+        upiLink,
+      });
+      
+      // Update the amounts
+      debtor.amount = round2(debtor.amount - pay);
+      creditor.amount = round2(creditor.amount - pay);
+    }
+    
+    // Move to next debtor or creditor if current one is settled
+    if (debtor.amount < 0.01) i++;
+    if (creditor.amount < 0.01) j++;
   }
+  
   return pairs;
 }
 
